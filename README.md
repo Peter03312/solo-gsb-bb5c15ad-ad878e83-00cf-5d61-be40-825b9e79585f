@@ -46,6 +46,14 @@
    导演调整其时段/场次（须通过第 3 条校验）后恢复有效。
 6. 导演可**取消**安排，并查看待补派、待调整与已取消的安排（`?status=` 可过滤）；
    演员只能看到**自己当前参与的有效时段**。
+7. 导演可在排练页**一次批量调整同一排练中至少两条未取消时段**的目标场次与带时区起止时间：
+   批次中**重复时段、跨排练时段、无台词场次、无效时间或空批次（不足两条）**一律 `400` 明确拒绝
+   （批次内时段不存在为 `404`、已取消时段为 `400`）；按**整批最终状态**统一检测
+   批内两两、与其他有效日程（跨排练）及本人不可用时段的重叠（端点相接允许，两条时段**互换时间**
+   在最终无冲突时成功）；**任一冲突整批不生效**，沿用 `409 SCHEDULE_CONFLICT` /
+   `UNAVAILABILITY_CONFLICT` 与 `details.conflicts`。成功时返回更新后的时段与**通知摘要**：
+   仅为实质变化（含待调整合法化）的时段各生成一批新通知，未变化的不重发；
+   已开启的到场登记与台词确认保持原快照。原单条调整（`PATCH`）与查询语义不变。
 
 ### 演员不可用时段
 
@@ -82,7 +90,7 @@
 
 ### 时段通知（知悉确认）
 
-1. 有效时段**创建**、**起止/场次调整**，以及**派角、撤派、显式换版**导致该时段的参与演员、
+1. 有效时段**创建**、**起止/场次调整**（单条或**批量调整**，批量按整批最终状态逐时段比对），以及**派角、撤派、显式换版**导致该时段的参与演员、
    角色或固定版本变化时，系统按**最终结果**为该时段生成新的**通知批次**，冻结：UTC 起止时段、
    场次、固定版本与当时参与演员（含各自角色）；**无实质变化不重复生成**（如同值调整、
    派角未改变参与者）。
@@ -174,7 +182,8 @@ PORT=8080 docker compose up --build -d
 - **导演 → 修订发布**：选基准版本建修订、逐条添加改/增/删（界面可一键填入所选台词原文）、
   勾选多个修订发布；冲突时页面展示每处冲突的“修订声称原文 vs 现行文本”，并可在发布记录中回看。
 - **导演 → 排练与确认**：创建固定版本的排练、显式换版、派角/改派，查看待确认清单与冲突；
-  为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；对有效时段**开启/查看/关闭到场登记**
+  为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；勾选至少两条未取消时段可**批量调整**
+  （整批校验冲突，成功后提示有实质变化并重发通知的条数，未变化不重发）；对有效时段**开启/查看/关闭到场登记**
   （名单、缺口、应到/签到/缺席统计）；在“知悉通知”列查看各时段**当前批次的已确认/待确认名单与
   历史批次**。排期/调期/派角/换版若撞上演员不可用时段，页面会提示冲突演员及其不可用时段与原因。
 - **导演 → 总览**：所有排练的待确认汇总与最近冲突详情。
@@ -207,6 +216,7 @@ PORT=8080 docker compose up --build -d
 | POST | `/api/rehearsals/:id/confirm` | 演员逐场确认 |
 | POST/GET | `/api/rehearsals/:id/schedules` | 安排时段（导演）/ 日程列表（导演含待补派·待调整·已取消，`?status=` 可过滤；演员仅自己参与的有效时段） |
 | PATCH | `/api/rehearsals/:id/schedules/:sid` | 调整时段/场次（导演；待调整的时段借此恢复有效） |
+| POST | `/api/rehearsals/:id/schedules/batch-adjust` | 批量调整（导演）：一次提交同一排练至少两条未取消时段的目标场次与带时区起止；按整批最终状态统一冲突检测，任一冲突整批不生效；仅实质变化时段重发通知 |
 | POST | `/api/rehearsals/:id/schedules/:sid/cancel` | 取消时段（导演，记录保留可查；联动到场登记见下） |
 | POST | `/api/rehearsals/:id/schedules/:sid/attendance` | 开启到场登记（导演；冻结名单/缺口/版本/UTC 时段，每时段至多一次） |
 | POST | `/api/rehearsals/:id/schedules/:sid/attendance/close` | 关闭登记（导演；未签到者记缺席） |
@@ -280,6 +290,66 @@ curl -s "http://localhost:3000/api/rehearsals/1/schedules" \
 派角/改派（`POST /api/rehearsals/:id/cast`）与显式换版（`POST /api/rehearsals/:id/switch-version`）
 同样做日程冲突校验：若新的参与演员与其他未取消时段重叠，返回 `409 SCHEDULE_CONFLICT` 且整次操作不生效
 （换版失败时版本与确认均不变）；换版成功时响应新增 `needsAdjustmentSchedules`（被标为待调整的时段 id 列表）。
+
+## 批量调整时段接口调用示例（curl）
+
+```bash
+# 1. 导演登录，拿到 token
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}'
+# -> {"token":"<TOKEN>",...}
+
+# 2. 一次提交同一排练中至少两条“未取消”时段的目标场次与带时区起止时间
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/batch-adjust \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"items":[
+    {"scheduleId":2,"sceneId":1,"startAt":"2026-10-04T14:00:00+08:00","endAt":"2026-10-04T15:00:00+08:00"},
+    {"scheduleId":3,"sceneId":2,"startAt":"2026-10-04T15:00:00+08:00","endAt":"2026-10-04T16:30:00+08:00"}
+  ]}'
+# -> 200 {"ok":true,
+#        "schedules":[{ ...更新后的完整时段（participants/pendingCast/attendance/notification 摘要同列表接口）,
+#                       "notificationChanged":true,"newNotificationId":6}, ...],
+#        "notifications":[{"scheduleId":2,"notificationId":6,"seq":2},
+#                         {"scheduleId":3,"notificationId":7,"seq":2}],
+#        "unchanged":[]}
+#    - 时间同样归一化为 UTC 返回；参与演员仍按排练当前固定版本与派角动态推导。
+#    - 两条互换时间（scheduleId 2 改成 3 的旧时间、3 改成 2 的旧时间）在最终无冲突时成功。
+#    - notifications 仅包含“有实质变化”的时段（起止/场次变化，或待调整合法化）；
+#      unchanged 列出未变化、未重发通知的时段 id，对应 schedule.notificationChanged=false。
+#    - 已开启的到场登记名单/签到与台词逐场确认保持开启时快照，不因批量调整改写。
+
+# 3. 明确拒绝的批次（均为 400，源时段不会有任何变化）：
+#    - items 缺失/不是数组/少于两条（空批次）：
+#      {"error":"BAD_REQUEST","message":"批量调整一次至少提交两条时段；单条调整请使用 PATCH ..."}
+#    - 同一批次出现重复 scheduleId：        400 "批次中存在重复时段 #2"
+#    - 时段属于其他排练（跨排练）：          400 "时段 #9 不属于排练…，批量调整仅限同一排练"
+#    - 时段已取消：                         400 "时段 #3 已取消，不能纳入批量调整，请重新创建"
+#    - 目标场次不存在/不属于该剧/当前固定版本无台词：400（与单条调整同一套校验文案）
+#    - 时间不带时区、非法或结束不晚于开始：  400
+#    - 批次内时段不存在：404 NOT_FOUND
+
+# 4. 按“整批最终状态”检测冲突（端点相接不算重叠）；任一冲突整批不生效：
+#    下面两条改完后在 10:30–11:00 交叠且参与演员相同 -> 409，两条都保持原时间
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/batch-adjust \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"items":[
+    {"scheduleId":2,"startAt":"2026-10-05T10:00:00+08:00","endAt":"2026-10-05T11:00:00+08:00"},
+    {"scheduleId":3,"startAt":"2026-10-05T10:30:00+08:00","endAt":"2026-10-05T11:30:00+08:00"}
+  ]}'
+# -> 409 {"error":"SCHEDULE_CONFLICT",
+#        "message":"批量调整后参与演员与其他未取消时段重叠，本次整批调整未生效",
+#        "details":{"conflicts":[{"actorId":2,"actorName":"林晚",
+#          "schedule":{"id":2,...,"startAt":"2026-10-05T02:00:00.000Z",...},
+#          "overlapsWith":{"id":3,"rehearsalId":1,...}}]}}
+#    - 与其他排练的有效日程、或与本人已登记不可用时段相撞：分别为
+#      409 SCHEDULE_CONFLICT / UNAVAILABILITY_CONFLICT，details.conflicts 结构与单条接口一致
+#      （不可用冲突含 unavailability: {id,startAt,endAt,reason}）。
+#    - 冲突失败不生成任何新通知批次（演员的待确认列表无变化）。
+
+# 5. 待调整时段可随批恢复有效：把换版后失去台词的待调整时段改到当前版本有台词的场次/时间，
+#    合法化后状态回到 active，并在 notifications 中各得一批新通知（恢复批自身有冲突同样整批拒绝、保持待调整）。
+```
 
 ## 到场登记接口调用示例（curl）
 
@@ -446,6 +516,8 @@ curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules \
 端到端测试会用临时数据目录自动起停服务器，覆盖：认证与越权、修订原文校验、
 多种发布冲突与幂等合并、版本快照不可改写触发器、换版后按内容变化重确认、改派后原确认失效、
 日程时段校验与重叠冲突（含跨时区/端点相接/跨排练）、派角与换版的日程冲突回滚、待调整与已取消可见性、
+批量调整（入参拒绝：重复/跨排练/已取消/无台词/无效时间/空批次；两条互换时间成功；批内/跨排练/不可用冲突整批回滚；
+端点相接；无实质变化不重发通知；保持到场登记快照；待调整随批恢复有效）、
 到场登记（开启冻结名单/缺口、签到幂等、改派换版调日程不回写、关闭记缺席、开放期取消作废与关闭后取消标注、
 导演/演员可见性）、演员不可用时段（登记/修改/撤销与本人可见、UTC 归一化、端点相接、
 已取消与待调整不参与、与本人有效日程重叠整次拒绝、导演排期/调期/派角/换版撞不可用整次不生效、

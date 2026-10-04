@@ -397,6 +397,169 @@ async function main() {
   await req('PATCH', `/api/rehearsals/${rhA}/schedules/${schA1.id}`, lin, { startAt: '2030-01-01T09:00:00+08:00' }, 403);
   check('未派角演员查看 403；演员不能调整/取消日程', true);
 
+  console.log('— 日程：批量调整入参校验（重复/跨排练/已取消/无台词/无效时间/空批次）—');
+  const rhF = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '批量排练F' }, 201)).id;
+  await J(`/api/rehearsals/${rhF}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhF}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const f1 = (await J(`/api/rehearsals/${rhF}/schedules`, director, { sceneId: sc1, startAt: '2032-01-01T10:00:00+08:00', endAt: '2032-01-01T11:00:00+08:00' }, 201)).schedule;
+  const f2 = (await J(`/api/rehearsals/${rhF}/schedules`, director, { sceneId: sc2, startAt: '2032-01-01T11:00:00+08:00', endAt: '2032-01-01T12:00:00+08:00' }, 201)).schedule;
+  const f3 = (await J(`/api/rehearsals/${rhF}/schedules`, director, { sceneId: sc1, startAt: '2032-01-03T10:00:00+08:00', endAt: '2032-01-03T11:00:00+08:00' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhF}/schedules/${f3.id}/cancel`, director, {}, 200);
+  const batchUrl = `/api/rehearsals/${rhF}/schedules/batch-adjust`;
+  await J(batchUrl, lin, { items: [{ scheduleId: f1.id }, { scheduleId: f2.id }] }, 403);
+  for (const bad of [undefined, {}, { items: 'x' }, { items: [] }, { items: [{ scheduleId: f1.id }] }]) {
+    await J(batchUrl, director, bad, 400);
+  }
+  check('批量调整：演员 403；非数组/空批次/不足两条 400', true);
+  const eDup = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-09-01T10:00:00+08:00', endAt: '2032-09-01T11:00:00+08:00' },
+    { scheduleId: f1.id, startAt: '2032-09-01T11:00:00+08:00', endAt: '2032-09-01T12:00:00+08:00' },
+  ] }, 400);
+  check('批次内重复时段拒绝', /重复时段/.test(eDup.message), eDup.message);
+  const eCross = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-09-01T10:00:00+08:00', endAt: '2032-09-01T11:00:00+08:00' },
+    { scheduleId: schC1.id, startAt: '2032-09-01T11:00:00+08:00', endAt: '2032-09-01T12:00:00+08:00' },
+  ] }, 400);
+  check('跨排练时段拒绝', /不属于排练/.test(eCross.message), eCross.message);
+  const eCancelled = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-09-01T10:00:00+08:00', endAt: '2032-09-01T11:00:00+08:00' },
+    { scheduleId: f3.id, startAt: '2032-09-01T11:00:00+08:00', endAt: '2032-09-01T12:00:00+08:00' },
+  ] }, 400);
+  check('已取消时段拒绝', /已取消/.test(eCancelled.message), eCancelled.message);
+  const eNoLines = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, sceneId: scEmpty, startAt: '2032-09-01T10:00:00+08:00', endAt: '2032-09-01T11:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-09-02T10:00:00+08:00', endAt: '2032-09-02T11:00:00+08:00' },
+  ] }, 400);
+  check('无台词场次拒绝', /没有台词/.test(eNoLines.message), eNoLines.message);
+  const eNoTz = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-09-01T10:00', endAt: '2032-09-01T11:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-09-02T10:00:00+08:00', endAt: '2032-09-02T11:00:00+08:00' },
+  ] }, 400);
+  const eOrder = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-09-01T11:00:00+08:00', endAt: '2032-09-01T10:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-09-02T10:00:00+08:00', endAt: '2032-09-02T11:00:00+08:00' },
+  ] }, 400);
+  check('无时区/起止颠倒拒绝', !!eNoTz.message && !!eOrder.message);
+  await J(batchUrl, director, { items: [
+    { scheduleId: 99999, startAt: '2032-09-01T10:00:00+08:00', endAt: '2032-09-01T11:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-09-02T10:00:00+08:00', endAt: '2032-09-02T11:00:00+08:00' },
+  ] }, 404);
+  check('批次中时段不存在返回 404', true);
+
+  console.log('— 日程：批量互换时间成功并各发一批通知 —');
+  const f1seq0 = (await G(`/api/rehearsals/${rhF}/schedules/${f1.id}/notifications`, director)).current.seq;
+  const f2seq0 = (await G(`/api/rehearsals/${rhF}/schedules/${f2.id}/notifications`, director)).current.seq;
+  const swapped = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-01-01T11:00:00+08:00', endAt: '2032-01-01T12:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-01-01T10:00:00+08:00', endAt: '2032-01-01T11:00:00+08:00' },
+  ] }, 200);
+  check('批量互换返回更新时段与通知摘要', swapped.schedules.length === 2
+    && swapped.notifications.length === 2
+    && swapped.schedules.every((s) => s.notificationChanged && s.newNotificationId)
+    && swapped.unchanged.length === 0, JSON.stringify(swapped.notifications));
+  check('互换后各生成新批次（seq+1）',
+    (await G(`/api/rehearsals/${rhF}/schedules/${f1.id}/notifications`, director)).current.seq === f1seq0 + 1
+    && (await G(`/api/rehearsals/${rhF}/schedules/${f2.id}/notifications`, director)).current.seq === f2seq0 + 1);
+  const linF = await G(`/api/rehearsals/${rhF}/schedules`, lin);
+  check('演员看到互换后的时段', linF.schedules.find((s) => s.id === f1.id).startAt === '2032-01-01T03:00:00.000Z'
+    && linF.schedules.find((s) => s.id === f2.id).startAt === '2032-01-01T02:00:00.000Z', JSON.stringify(linF.schedules.map((s) => s.startAt)));
+
+  console.log('— 日程：批量最终状态冲突整批不生效（批内/不可用/跨排练）—');
+  const eInternal = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-02-01T10:00:00+08:00', endAt: '2032-02-01T11:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-02-01T10:30:00+08:00', endAt: '2032-02-01T11:30:00+08:00' },
+  ] }, 409);
+  check('批内最终重叠返回 SCHEDULE_CONFLICT 且含演员/双方时段',
+    eInternal.error === 'SCHEDULE_CONFLICT'
+    && eInternal.details.conflicts.some((c) => c.actorId === linId && c.schedule.id === f1.id && c.overlapsWith.id === f2.id),
+    JSON.stringify(eInternal.details));
+  const afterInternal = await G(`/api/rehearsals/${rhF}/schedules`, director);
+  check('批内冲突整批回滚（仍为互换后的时间）',
+    afterInternal.schedules.find((s) => s.id === f1.id).startAt === '2032-01-01T03:00:00.000Z'
+    && afterInternal.schedules.find((s) => s.id === f2.id).startAt === '2032-01-01T02:00:00.000Z');
+  check('批内冲突不留新批次',
+    (await G(`/api/rehearsals/${rhF}/schedules/${f1.id}/notifications`, director)).current.seq === f1seq0 + 1);
+
+  const unBatch = (await J('/api/me/unavailability', lin, { startAt: '2032-03-01T09:00:00+08:00', endAt: '2032-03-01T12:00:00+08:00', reason: '批量冲突' }, 201)).unavailability;
+  const eUnavail = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-03-01T10:00:00+08:00', endAt: '2032-03-01T11:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-03-02T10:00:00+08:00', endAt: '2032-03-02T11:00:00+08:00' },
+  ] }, 409);
+  check('撞本人不可用返回 UNAVAILABILITY_CONFLICT（演员/时段/不可用记录）',
+    eUnavail.error === 'UNAVAILABILITY_CONFLICT'
+    && eUnavail.details.conflicts.some((c) => c.actorId === linId && c.schedule.id === f1.id && c.unavailability.id === unBatch.id),
+    JSON.stringify(eUnavail.details));
+  check('不可用冲突整批回滚', (await G(`/api/rehearsals/${rhF}/schedules`, director)).schedules.find((s) => s.id === f1.id).startAt === '2032-01-01T03:00:00.000Z');
+  await D(`/api/me/unavailability/${unBatch.id}`, lin, 200);
+
+  const fCross = (await J(`/api/rehearsals/${rhC}/schedules`, director, { sceneId: sc1, startAt: '2032-04-01T10:00:00+08:00', endAt: '2032-04-01T11:00:00+08:00' }, 201)).schedule;
+  const eXReh = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-04-01T10:30:00+08:00', endAt: '2032-04-01T11:30:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-04-02T10:00:00+08:00', endAt: '2032-04-02T11:00:00+08:00' },
+  ] }, 409);
+  check('与其他排练有效日程冲突 409 并指出对方时段',
+    eXReh.error === 'SCHEDULE_CONFLICT'
+    && eXReh.details.conflicts.some((c) => c.overlapsWith.id === fCross.id), JSON.stringify(eXReh.details));
+
+  console.log('— 日程：批量端点相接允许 / 无实质变化不重发通知 —');
+  const touch = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-05-01T10:00:00+08:00', endAt: '2032-05-01T11:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-05-01T11:00:00+08:00', endAt: '2032-05-01T12:00:00+08:00' },
+  ] }, 200);
+  check('端点相接批内不冲突', touch.schedules.length === 2);
+  const f1seqTouch = (await G(`/api/rehearsals/${rhF}/schedules/${f1.id}/notifications`, director)).current.seq;
+  const nochg = await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-05-01T10:00:00+08:00', endAt: '2032-05-01T11:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-05-01T11:00:00+08:00', endAt: '2032-05-01T12:00:00+08:00' },
+  ] }, 200);
+  check('无实质变化的批次不重发通知', nochg.notifications.length === 0
+    && nochg.unchanged.length === 2
+    && nochg.schedules.every((s) => s.notificationChanged === false), JSON.stringify(nochg));
+  check('无变化批次后 seq 不变', (await G(`/api/rehearsals/${rhF}/schedules/${f1.id}/notifications`, director)).current.seq === f1seqTouch);
+
+  console.log('— 日程：批量调整保持到场登记快照 —');
+  const fAtt = (await J(`/api/rehearsals/${rhF}/schedules/${f1.id}/attendance`, director, {}, 201)).session;
+  await J(`/api/rehearsals/${rhF}/schedules/${f1.id}/attendance/check-in`, lin, {}, 201);
+  await J(batchUrl, director, { items: [
+    { scheduleId: f1.id, startAt: '2032-06-01T10:00:00+08:00', endAt: '2032-06-01T11:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2032-06-02T10:00:00+08:00', endAt: '2032-06-02T11:00:00+08:00' },
+  ] }, 200);
+  const fAttAfter = (await G(`/api/rehearsals/${rhF}/schedules/${f1.id}/attendance`, director)).session;
+  check('批量改时间不回写登记快照（UTC 时段/版本/签到保留）',
+    fAttAfter.startAt === fAtt.startAt && fAttAfter.versionId === fAtt.versionId
+    && fAttAfter.roster.some((m) => m.actorId === linId && m.state === 'checked_in'),
+    `${fAttAfter.startAt} vs ${fAtt.startAt}`);
+
+  console.log('— 日程：待调整时段批量合法化后恢复有效并发新批次 —');
+  const rhG = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '批量排练G' }, 201)).id;
+  await J(`/api/rehearsals/${rhG}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhG}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const g1 = (await J(`/api/rehearsals/${rhG}/schedules`, director, { sceneId: sc2, startAt: '2032-07-01T10:00:00+08:00', endAt: '2032-07-01T11:00:00+08:00' }, 201)).schedule;
+  const g2 = (await J(`/api/rehearsals/${rhG}/schedules`, director, { sceneId: sc2, startAt: '2032-07-02T10:00:00+08:00', endAt: '2032-07-02T11:00:00+08:00' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhG}/switch-version`, director, { versionId: pv3 }, 200);
+  check('换版后两条均待调整', (await G(`/api/rehearsals/${rhG}/schedules?status=needs_adjustment`, director)).schedules.length === 2);
+  // 恢复批中故意保留一处冲突 -> 整批拒绝且仍为待调整
+  const eRecoverConflict = await J(`/api/rehearsals/${rhG}/schedules/batch-adjust`, director, { items: [
+    { scheduleId: g1.id, sceneId: sc1, startAt: '2032-08-01T10:00:00+08:00', endAt: '2032-08-01T11:00:00+08:00' },
+    { scheduleId: g2.id, sceneId: sc1, startAt: '2032-08-01T10:30:00+08:00', endAt: '2032-08-01T11:30:00+08:00' },
+  ] }, 409);
+  check('恢复批冲突返回 409 且整批仍待调整', eRecoverConflict.error === 'SCHEDULE_CONFLICT'
+    && (await G(`/api/rehearsals/${rhG}/schedules?status=needs_adjustment`, director)).schedules.length === 2);
+  const recovered = await J(`/api/rehearsals/${rhG}/schedules/batch-adjust`, director, { items: [
+    { scheduleId: g1.id, sceneId: sc1, startAt: '2032-08-01T10:00:00+08:00', endAt: '2032-08-01T11:00:00+08:00' },
+    { scheduleId: g2.id, sceneId: sc1, startAt: '2032-08-02T10:00:00+08:00', endAt: '2032-08-02T11:00:00+08:00' },
+  ] }, 200);
+  check('待调整两条批量合法化后恢复有效', recovered.schedules.length === 2
+    && recovered.schedules.every((s) => s.status === 'active' && s.sceneId === sc1),
+    JSON.stringify(recovered.schedules.map((s) => ({ st: s.status, sc: s.sceneId }))));
+  const g1view = await G(`/api/rehearsals/${rhG}/schedules/${g1.id}/notifications`, director);
+  const g2view = await G(`/api/rehearsals/${rhG}/schedules/${g2.id}/notifications`, director);
+  check('恢复有效各生成新批次（seq=2，冻结新场次/版本）',
+    g1view.current.seq === 2 && g1view.current.sceneId === sc1 && g1view.current.versionId === pv3
+    && g2view.current.seq === 2, JSON.stringify({ a: g1view.current?.seq, b: g2view.current?.seq }));
+  const linG = await G(`/api/rehearsals/${rhG}/schedules`, lin);
+  check('演员重新可见恢复后的时段', linG.schedules.length === 2 && linG.schedules.every((s) => s.status === 'active'));
+
   console.log('— 到场登记：开启冻结名单与缺口 —');
   // 专用剧本 p3：AT1/AT2；角色 RX/RY/RZ；v1 三角在 AT1 均有台词；v2 仅改 RX 文本（场次台词仍在）
   const p3 = await J('/api/plays', director, { title: '登记测试剧' }, 201);

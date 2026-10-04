@@ -7,7 +7,7 @@ const ATT_STATE_LABEL = { checked_in: '已签到', pending: '待签到', absent:
 const ATT_STATE_CLASS = { checked_in: 'done', pending: 'pending', absent: 'abandoned', unmarked: 'abandoned' };
 const NOTIF_STATUS_LABEL = { current: '当前批次', superseded: '已被取代', inactive: '已失效' };
 const NOTIF_STATUS_CLASS = { current: 'open', superseded: 'abandoned', inactive: 'abandoned' };
-const NOTIF_REASON_LABEL = { create: '创建时段', adjust: '调整时段', cast: '派角/撤派', version_switch: '显式换版' };
+const NOTIF_REASON_LABEL = { create: '创建时段', adjust: '调整时段', batch_adjust: '批量调整时段', cast: '派角/撤派', version_switch: '显式换版' };
 const MY_NOTIF_STATE_LABEL = { pending: '待确认', confirmed: '已确认', superseded: '已被新批次取代', inactive: '已失效' };
 const MY_NOTIF_STATE_CLASS = { pending: 'pending', confirmed: 'done', superseded: 'abandoned', inactive: 'abandoned' };
 
@@ -236,6 +236,16 @@ function renderRehearsalDetail(data, reload) {
         <button class="btn small schedCancelEdit hidden" type="button">放弃调整</button>
       </form>
       <div class="muted">按本地时间选择，提交时自动携带时区；结束须晚于开始。未派角角色列为“待补派”，不阻止安排。</div>
+      <div class="batchBox" style="margin-top:10px;display:none">
+        <h3 style="margin-bottom:4px">批量调整时段（至少两条；整批按最终状态校验，任一冲突整批不生效）</h3>
+        <div class="muted batchSelected">尚未选择时段</div>
+        <div class="batchRows"></div>
+        <div class="flex" style="margin-top:6px">
+          <button class="btn small primary batchSubmit" type="button">整批提交</button>
+          <button class="btn small batchCancel" type="button">收起批量调整</button>
+        </div>
+        <div class="muted">每行可改目标场次与起止时间；只勾选本排练内未取消的时段。无实质变化的行不会重发通知；待调整时段合法化后随批恢复有效。</div>
+      </div>
     </div>`);
   wrap.appendChild(schedBox);
   setupScheduleEditor(schedBox, rehearsal);
@@ -382,12 +392,87 @@ async function showAttendanceDetail(schedBox, rehearsal, scheduleId) {
     </div>`;
 }
 
-/** 导演：排练日程的列表 / 新建 / 调整 / 取消 */
+/** 导演：排练日程的列表 / 新建 / 单条调整 / 取消 / 批量调整 */
 function setupScheduleEditor(schedBox, rehearsal) {
   const sceneSel = schedBox.querySelector('.sceneSel');
   const submitBtn = schedBox.querySelector('.schedSubmit');
   const cancelEditBtn = schedBox.querySelector('.schedCancelEdit');
+  const batchBox = schedBox.querySelector('.batchBox');
+  const batchRows = schedBox.querySelector('.batchRows');
+  const batchSelected = schedBox.querySelector('.batchSelected');
   let editingId = null;
+  let lastSchedules = [];
+  const batchIds = new Set(); // 勾选待批量调整的时段 id
+
+  // 渲染批量调整面板：每个所选时段一行（场次下拉 + 起止时间，预填当前值）
+  function renderBatchBox(schedules) {
+    lastSchedules = schedules;
+    const picked = schedules.filter((s) => batchIds.has(s.id));
+    batchSelected.textContent = picked.length
+      ? `已选 ${picked.length} 条：#${picked.map((s) => s.id).join('、#')}`
+      : '尚未选择时段';
+    batchRows.innerHTML = picked.length
+      ? `<table>
+          <tr><th>时段</th><th>场次</th><th>开始</th><th>结束</th></tr>
+          ${picked
+            .map(
+              (s) => `<tr data-id="${s.id}">
+                <td>#${s.id} <span class="badge ${SCHED_STATUS_CLASS[s.status]}">${SCHED_STATUS_LABEL[s.status]}</span></td>
+                <td><select class="bScene" style="max-width:170px">${sceneSel.innerHTML}</select></td>
+                <td><input type="datetime-local" class="bStart" style="max-width:200px" value="${toLocalInput(s.startAt)}" /></td>
+                <td><input type="datetime-local" class="bEnd" style="max-width:200px" value="${toLocalInput(s.endAt)}" /></td>
+              </tr>`
+            )
+            .join('')}
+        </table>`
+      : '<span class="muted">请先在上方表格勾选至少两条未取消时段。</span>';
+    // 预选每行当前场次
+    picked.forEach((s) => {
+      const tr = batchRows.querySelector(`tr[data-id="${s.id}"]`);
+      if (tr) tr.querySelector('.bScene').value = String(s.sceneId);
+    });
+    batchBox.style.display = '';
+  }
+
+  schedBox.querySelector('.batchCancel').addEventListener('click', () => {
+    batchBox.style.display = 'none';
+  });
+
+  schedBox.querySelector('.batchSubmit').addEventListener('click', async () => {
+    const picked = lastSchedules.filter((s) => batchIds.has(s.id));
+    if (picked.length < 2) {
+      toast('批量调整一次至少选择两条时段（单条请用“调整”）', true);
+      return;
+    }
+    const items = [];
+    for (const s of picked) {
+      const tr = batchRows.querySelector(`tr[data-id="${s.id}"]`);
+      if (!tr) continue;
+      const startVal = tr.querySelector('.bStart').value;
+      const endVal = tr.querySelector('.bEnd').value;
+      if (!startVal || !endVal) {
+        toast(`时段 #${s.id} 的起止时间不能为空`, true);
+        return;
+      }
+      items.push({
+        scheduleId: s.id,
+        sceneId: Number(tr.querySelector('.bScene').value),
+        startAt: new Date(startVal).toISOString(),
+        endAt: new Date(endVal).toISOString(),
+      });
+    }
+    try {
+      const data = await api('POST', `/api/rehearsals/${rehearsal.id}/schedules/batch-adjust`, { items });
+      const changed = data.notifications.length;
+      const unchanged = data.unchanged.length;
+      toast(`整批调整已生效：${changed} 条时段有实质变化并已生成通知${unchanged ? `，${unchanged} 条无变化未重发` : ''}`);
+      batchIds.clear();
+      batchBox.style.display = 'none';
+      reloadSchedules();
+    } catch (err) {
+      toast(scheduleErr(err), true);
+    }
+  });
 
   api('GET', `/api/plays/${rehearsal.playId}`).then((detail) => {
     sceneSel.innerHTML = detail.scenes
@@ -413,13 +498,19 @@ function setupScheduleEditor(schedBox, rehearsal) {
     }
     schedBox.querySelector('.attDetail').innerHTML = '';
     schedBox.querySelector('.notifDetail').innerHTML = '';
+    // 已取消或不再存在的时段不能再纳入批量调整，从勾选集合中剔除
+    for (const id of [...batchIds]) {
+      if (!schedules.some((s) => s.id === id && s.status !== 'cancelled')) batchIds.delete(id);
+    }
+    if (batchBox.style.display !== 'none') renderBatchBox(schedules);
     if (!schedules.length) {
       rowsBox.innerHTML = '<span class="muted">暂无日程</span>';
       return;
     }
     rowsBox.innerHTML = `<table>
-      <tr><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>到场登记</th><th>知悉通知</th><th>操作</th></tr>
+      <tr><th>选择</th><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>到场登记</th><th>知悉通知</th><th>操作</th></tr>
       ${schedules.map((s) => `<tr>
+        <td>${s.status !== 'cancelled' ? `<input type="checkbox" class="pickSched" data-id="${s.id}"${batchIds.has(s.id) ? ' checked' : ''} />` : ''}</td>
         <td>${esc(s.sceneCode)} ${esc(s.sceneTitle)}</td>
         <td>${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</td>
         <td><span class="badge ${SCHED_STATUS_CLASS[s.status]}">${SCHED_STATUS_LABEL[s.status]}</span></td>
@@ -432,7 +523,21 @@ function setupScheduleEditor(schedBox, rehearsal) {
              <button class="btn small danger cancelSched" data-id="${s.id}">取消</button>`
           : ''}</td>
       </tr>`).join('')}
-    </table>`;
+    </table>
+    <div class="flex" style="margin-top:6px">
+      <button class="btn small openBatch" type="button">批量调整所选时段…</button>
+      <span class="muted batchCount">已选 ${schedules.filter((s) => batchIds.has(s.id)).length} 条（至少 2 条）</span>
+    </div>`;
+    rowsBox.querySelectorAll('.pickSched').forEach((cb) =>
+      cb.addEventListener('change', () => {
+        const id = Number(cb.dataset.id);
+        if (cb.checked) batchIds.add(id);
+        else batchIds.delete(id);
+        rowsBox.querySelector('.batchCount').textContent =
+          `已选 ${batchIds.size} 条（至少 2 条）`;
+      })
+    );
+    rowsBox.querySelector('.openBatch').addEventListener('click', () => renderBatchBox(schedules));
     rowsBox.querySelectorAll('.cancelSched').forEach((b) =>
       b.addEventListener('click', async () => {
         try {

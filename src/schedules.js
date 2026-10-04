@@ -311,7 +311,7 @@ function notificationFingerprint({ sceneId, versionId, startAt, endAt, participa
  *     否则旧批次标为 superseded，按最终结果生成新批次并冻结
  *     UTC 时段、场次、固定版本与当时参与演员；无当前批次（新建/恢复有效）直接生成。
  *   - 已取消/待调整时段：当前批次标为 inactive（不再待确认，保留为历史）。
- * 返回新批次 id 列表。
+ * 返回新批次列表：[{ scheduleId, notificationId, seq }]（仅含本次实质变化并生成新批次的时段）。
  */
 function syncScheduleNotifications(rehearsalId, reason, actorId = null) {
   const rehearsal = db.prepare('SELECT * FROM rehearsals WHERE id = ?').get(rehearsalId);
@@ -357,7 +357,7 @@ function syncScheduleNotifications(rehearsalId, reason, actorId = null) {
       'INSERT INTO schedule_notification_recipients (notification_id, actor_id, roles_json) VALUES (?, ?, ?)'
     );
     for (const p of participants) ins.run(id, p.actorId, JSON.stringify(p.roles));
-    created.push(id);
+    created.push({ scheduleId: s.id, notificationId: id, seq });
   }
   return created;
 }
@@ -581,6 +581,95 @@ router.patch(
       syncScheduleNotifications(r.id, 'adjust', req.user.id);
     });
     res.json({ schedule: serializeSchedule(getScheduleOrThrow(s.id, r.id), r) });
+  })
+);
+
+// ---- 导演：同一排练内一次批量调整至少两条未取消时段 ----
+// 按整批最终状态统一校验：批内两两、与其他有效日程、与本人不可用时段均无重叠方可提交；
+// 任一冲突整批不生效（同一事务，沿用 409 SCHEDULE_CONFLICT / UNAVAILABILITY_CONFLICT）。
+// 仅为实质变化的时段生成新通知批次；未变化的不重发；待调整时段合法化后随批恢复有效。
+router.post(
+  '/rehearsals/:id/schedules/batch-adjust',
+  wrap((req, res) => {
+    if (req.user.role !== 'director') throw forbidden();
+    const r = getRehearsalOrThrow(req.params.id);
+
+    // —— 批次级入参校验（先于任何写操作）——
+    const items = req.body?.items ?? req.body; // 兼容 {items:[...]} 与裸数组
+    if (!Array.isArray(items)) {
+      throw badRequest('请求体须为 items 数组（每项含 scheduleId 与目标场次/起止时间）');
+    }
+    if (items.length < 2) {
+      throw badRequest('批量调整一次至少提交两条时段；单条调整请使用 PATCH /schedules/:scheduleId');
+    }
+
+    // —— 逐条解析与校验：重复时段、跨排练时段、已取消时段、无台词场次、无效时间全部 400 明确拒绝 ——
+    const seen = new Set();
+    const parsed = [];
+    items.forEach((item, idx) => {
+      const where = `第 ${idx + 1} 条`;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        throw badRequest(`${where}：条目必须是对象`);
+      }
+      const scheduleId = Number(item.scheduleId);
+      if (!Number.isInteger(scheduleId)) throw badRequest(`${where}：scheduleId 必填且为整数`);
+      if (seen.has(scheduleId)) throw badRequest(`${where}：批次中存在重复时段 #${scheduleId}`);
+      seen.add(scheduleId);
+      const s = db
+        .prepare('SELECT * FROM rehearsal_schedules WHERE id = ?')
+        .get(scheduleId);
+      if (!s) throw notFound(`${where}：日程安排 #${scheduleId} 不存在`);
+      if (s.rehearsal_id !== r.id) {
+        throw badRequest(`${where}：时段 #${scheduleId} 不属于排练“${r.name}”，批量调整仅限同一排练`);
+      }
+      if (s.status === 'cancelled') {
+        throw badRequest(`${where}：时段 #${scheduleId} 已取消，不能纳入批量调整，请重新创建`);
+      }
+      // 场次归属/当前固定版本有台词 + 带时区起止 + 结束晚于开始（待调整时段亦可借此合法化）
+      const { sceneId, startAt, endAt } = validateSceneAndTimes(r, item, s);
+      parsed.push({ s, scheduleId, sceneId, startAt, endAt });
+    });
+
+    const result = transaction(() => {
+      // 先按目标值整批落库（仍在同一事务内：后续抛错即整体回滚，整批不生效）
+      for (const x of parsed) {
+        db.prepare(
+          "UPDATE rehearsal_schedules SET scene_id = ?, start_at = ?, end_at = ?, status = 'active' WHERE id = ?"
+        ).run(x.sceneId, x.startAt, x.endAt, x.scheduleId);
+      }
+      // 以整批最终状态构造候选：批内两两（如两条互换时间）+ 与库中其他有效时段（本批 ids 跳过）统一检测
+      const candidates = parsed.map((x) =>
+        buildCandidate({ scheduleId: x.scheduleId, rehearsal: r, sceneId: x.sceneId, startAt: x.startAt, endAt: x.endAt })
+      );
+      assertNoScheduleConflicts(candidates, '批量调整后参与演员与其他未取消时段重叠，本次整批调整未生效');
+      assertNoUnavailabilityConflicts(
+        candidates,
+        '批量调整后参与演员在该时段已登记不可用，本次整批调整未生效'
+      );
+      // 仅实质变化（指纹不同，含待调整恢复有效）的时段生成新批次；未变化的不重发
+      const created = syncScheduleNotifications(r.id, 'batch_adjust', req.user.id);
+      return { created: new Map(created.map((x) => [x.scheduleId, x])) };
+    });
+
+    const schedules = parsed.map((x) => {
+      const row = getScheduleOrThrow(x.scheduleId, r.id);
+      const out = serializeSchedule(row, r);
+      const n = result.created.get(x.scheduleId);
+      out.notificationChanged = !!n;
+      if (n) out.newNotificationId = n.notificationId;
+      return out;
+    });
+    const notifications = [...result.created.entries()].map(([scheduleId, n]) => ({
+      scheduleId,
+      notificationId: n.notificationId,
+      seq: n.seq,
+    }));
+    res.json({
+      ok: true,
+      schedules,
+      notifications,
+      unchanged: parsed.filter((x) => !result.created.has(x.scheduleId)).map((x) => x.scheduleId),
+    });
   })
 );
 

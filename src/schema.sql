@@ -298,7 +298,7 @@ CREATE TABLE IF NOT EXISTS schedule_notifications (
   fingerprint   TEXT NOT NULL,                   -- 实质内容指纹（时段/场次/版本/参与演员及角色）
   status        TEXT NOT NULL DEFAULT 'current'
                   CHECK (status IN ('current', 'superseded', 'inactive')),
-  reason        TEXT NOT NULL DEFAULT '',        -- create / adjust / cast / version_switch
+  reason        TEXT NOT NULL DEFAULT '',        -- create / adjust / batch_adjust / cast / version_switch
   created_by    INTEGER REFERENCES users(id),
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (schedule_id, seq)
