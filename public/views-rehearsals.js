@@ -7,7 +7,7 @@ const ATT_STATE_LABEL = { checked_in: '已签到', pending: '待签到', absent:
 const ATT_STATE_CLASS = { checked_in: 'done', pending: 'pending', absent: 'abandoned', unmarked: 'abandoned' };
 const NOTIF_STATUS_LABEL = { current: '当前批次', superseded: '已被取代', inactive: '已失效' };
 const NOTIF_STATUS_CLASS = { current: 'open', superseded: 'abandoned', inactive: 'abandoned' };
-const NOTIF_REASON_LABEL = { create: '创建时段', adjust: '调整时段', cast: '派角/撤派', version_switch: '显式换版' };
+const NOTIF_REASON_LABEL = { create: '创建时段', adjust: '调整时段', batch_adjust: '批量调整时段', cast: '派角/撤派', version_switch: '显式换版' };
 const MY_NOTIF_STATE_LABEL = { pending: '待确认', confirmed: '已确认', superseded: '已被新批次取代', inactive: '已失效' };
 const MY_NOTIF_STATE_CLASS = { pending: 'pending', confirmed: 'done', superseded: 'abandoned', inactive: 'abandoned' };
 
@@ -234,8 +234,10 @@ function renderRehearsalDetail(data, reload) {
         <input type="datetime-local" name="endAt" required style="max-width:210px" />
         <button class="btn small primary schedSubmit" type="submit">保存时段</button>
         <button class="btn small schedCancelEdit hidden" type="button">放弃调整</button>
+        <button class="btn small batchToggle" type="button">批量调整…</button>
       </form>
       <div class="muted">按本地时间选择，提交时自动携带时区；结束须晚于开始。未派角角色列为“待补派”，不阻止安排。</div>
+      <div class="batchBox hidden"></div>
     </div>`);
   wrap.appendChild(schedBox);
   setupScheduleEditor(schedBox, rehearsal);
@@ -382,17 +384,23 @@ async function showAttendanceDetail(schedBox, rehearsal, scheduleId) {
     </div>`;
 }
 
-/** 导演：排练日程的列表 / 新建 / 调整 / 取消 */
+/** 导演：排练日程的列表 / 新建 / 调整 / 取消 / 批量调整 */
 function setupScheduleEditor(schedBox, rehearsal) {
   const sceneSel = schedBox.querySelector('.sceneSel');
   const submitBtn = schedBox.querySelector('.schedSubmit');
   const cancelEditBtn = schedBox.querySelector('.schedCancelEdit');
+  const batchToggleBtn = schedBox.querySelector('.batchToggle');
+  const batchBox = schedBox.querySelector('.batchBox');
   let editingId = null;
+  let scenes = [];
+  let currentSchedules = [];
+
+  const sceneOptions = (selectedId) =>
+    scenes.map((s) => `<option value="${s.id}"${String(s.id) === String(selectedId) ? ' selected' : ''}>${esc(s.code)} ${esc(s.title)}</option>`).join('');
 
   api('GET', `/api/plays/${rehearsal.playId}`).then((detail) => {
-    sceneSel.innerHTML = detail.scenes
-      .map((s) => `<option value="${s.id}">${esc(s.code)} ${esc(s.title)}</option>`)
-      .join('');
+    scenes = detail.scenes;
+    sceneSel.innerHTML = sceneOptions(scenes[0]?.id);
   });
 
   const resetEdit = () => {
@@ -411,6 +419,7 @@ function setupScheduleEditor(schedBox, rehearsal) {
       rowsBox.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
       return;
     }
+    currentSchedules = schedules;
     schedBox.querySelector('.attDetail').innerHTML = '';
     schedBox.querySelector('.notifDetail').innerHTML = '';
     if (!schedules.length) {
@@ -501,6 +510,66 @@ function setupScheduleEditor(schedBox, rehearsal) {
       resetEdit();
       reloadSchedules();
     } catch (err) { toast(scheduleErr(err), true); }
+  });
+
+  // ---- 批量调整：勾选同一排练中至少两条未取消时段，一次性提交目标场次与起止时间 ----
+  // 整批按最终状态统一校验（批内互换时间允许）；任一冲突整批不生效。
+  function openBatchBox() {
+    const adjustable = currentSchedules.filter((s) => s.status !== 'cancelled');
+    batchBox.innerHTML = `
+      <h4 style="margin:10px 0 4px">批量调整时段</h4>
+      <div class="muted">勾选至少两条“未取消”时段并设定新的场次/起止时间后一次提交；
+        服务端按整批最终状态校验重叠（端点相接允许），任一冲突整批不生效；只有实质变化的时段会重发通知。</div>
+      ${adjustable.length < 2 ? '<div class="muted">可调整（未取消）时段不足两条，无法批量提交。</div>' : ''}
+      <table class="batchTable">
+        <tr><th>勾选</th><th>时段</th><th>当前</th><th>新场次</th><th>新开始</th><th>新结束</th></tr>
+        ${adjustable.map((s) => `<tr data-id="${s.id}">
+          <td><input type="checkbox" class="batchPick" data-id="${s.id}" /></td>
+          <td>#${s.id}</td>
+          <td class="muted">${esc(s.sceneCode)} ${esc(s.sceneTitle)}<br/>${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</td>
+          <td><select class="batchScene">${sceneOptions(s.sceneId)}</select></td>
+          <td><input type="datetime-local" class="batchStart" value="${toLocalInput(s.startAt)}" /></td>
+          <td><input type="datetime-local" class="batchEnd" value="${toLocalInput(s.endAt)}" /></td>
+        </tr>`).join('')}
+      </table>
+      <div class="flex" style="margin-top:6px">
+        <button class="btn small primary batchSubmit" type="button" ${adjustable.length < 2 ? 'disabled' : ''}>提交批量调整</button>
+        <button class="btn small batchClose" type="button">收起</button>
+        <span class="batchResult muted"></span>
+      </div>`;
+    batchBox.classList.remove('hidden');
+    batchBox.querySelector('.batchClose').addEventListener('click', () => batchBox.classList.add('hidden'));
+    batchBox.querySelector('.batchSubmit').addEventListener('click', submitBatch);
+  }
+
+  async function submitBatch() {
+    const rows = [...batchBox.querySelectorAll('tr[data-id]')];
+    const picked = rows.filter((tr) => tr.querySelector('.batchPick').checked);
+    const resultEl = batchBox.querySelector('.batchResult');
+    if (picked.length < 2) {
+      resultEl.textContent = '请至少勾选两条时段。';
+      return;
+    }
+    const items = picked.map((tr) => ({
+      scheduleId: Number(tr.dataset.id),
+      sceneId: Number(tr.querySelector('.batchScene').value),
+      startAt: new Date(tr.querySelector('.batchStart').value).toISOString(),
+      endAt: new Date(tr.querySelector('.batchEnd').value).toISOString(),
+    }));
+    try {
+      const data = await api('POST', `/api/rehearsals/${rehearsal.id}/schedules/batch`, { items });
+      toast(`批量调整已提交：${data.changed.length} 个时段生成新通知，${data.schedules.length - data.changed.length} 个无实质变化未重发`);
+      batchBox.classList.add('hidden');
+      reloadSchedules();
+    } catch (err) {
+      resultEl.textContent = scheduleErr(err);
+      toast(scheduleErr(err), true);
+    }
+  }
+
+  batchToggleBtn.addEventListener('click', () => {
+    if (batchBox.classList.contains('hidden')) openBatchBox();
+    else batchBox.classList.add('hidden');
   });
 
   reloadSchedules();

@@ -15,6 +15,11 @@ const { authRequired } = require('./auth');
  *   - 上述操作同时检查参与演员登记的“不可用时段”（actor_unavailability），
  *     相撞即整次不生效，返回演员、日程及不可用时段（409 UNAVAILABILITY_CONFLICT）。
  *   - 端点相接不算重叠（半开区间 [start, end)）。
+ *   - 导演可在排练页一次提交同一排练中至少两条“未取消”时段的目标场次与带时区起止
+ *     （POST .../schedules/batch）：按整批最终状态统一校验批内两两、与其他有效日程
+ *     （跨排练同演员）及参与演员本人不可用时段，任一冲突整批不生效；
+ *     两条时段互换时间等“单看冲突、最终合法”的批次可以成功；
+ *     成功后仅实质变化的时段各生成一批通知（未变化不重发），待调整时段合法化即恢复有效。
  *   - 换版后场次在新版本中已无台词的既有安排标为“待调整”，不参与冲突检测；
  *     失败的换版整体回滚，不改变版本与确认。
  *
@@ -581,6 +586,88 @@ router.patch(
       syncScheduleNotifications(r.id, 'adjust', req.user.id);
     });
     res.json({ schedule: serializeSchedule(getScheduleOrThrow(s.id, r.id), r) });
+  })
+);
+
+// ---- 导演：一次批量调整同一排练中至少两条未取消时段（整批原子提交） ----
+// 批次按“最终状态”统一做冲突校验：批内两两、与其他未取消有效日程（跨排练同演员）、
+// 参与演员本人不可用时段；任一冲突整批不生效。重复时段、跨排练时段、无台词场次、
+// 无效时间或空批次均明确拒绝。成功后仅实质变化的时段生成新通知批次。
+router.post(
+  '/rehearsals/:id/schedules/batch',
+  wrap((req, res) => {
+    if (req.user.role !== 'director') throw forbidden();
+    const r = getRehearsalOrThrow(req.params.id);
+    const items = req.body?.items;
+    if (!Array.isArray(items) || items.length === 0) {
+      throw badRequest('items 必填且为非空数组（一次至少提交两条未取消时段）');
+    }
+    if (items.length < 2) throw badRequest('批量调整一次至少提交两条时段（单条请使用 PATCH）');
+
+    // 先整批解析与校验（事务前完成，参数类问题一律 400）：
+    //   - scheduleId 必须为该排练存在的整数（不存在 404）；
+    //   - 同批不得重复指向同一时段；
+    //   - 已取消时段不可调整；场次归属/当前版本有台词/起止时间均按单条同一套规则校验。
+    const seenIds = new Set();
+    const targets = items.map((it) => {
+      if (!it || typeof it !== 'object') throw badRequest('每个条目必须是对象（含 scheduleId / sceneId / startAt / endAt）');
+      const scheduleId = Number(it.scheduleId);
+      if (!Number.isInteger(scheduleId)) throw badRequest('scheduleId 必填且为整数');
+      if (seenIds.has(scheduleId)) throw badRequest(`时段 #${scheduleId} 在批次中重复提交`);
+      seenIds.add(scheduleId);
+      const s = db
+        .prepare('SELECT * FROM rehearsal_schedules WHERE id = ? AND rehearsal_id = ?')
+        .get(scheduleId, r.id);
+      if (!s) {
+        // 完全不存在 -> 404；存在但属于其他排练 -> 400（跨排练时段明确拒绝）
+        const any = db.prepare('SELECT 1 FROM rehearsal_schedules WHERE id = ?').get(scheduleId);
+        if (any) throw badRequest(`时段 #${scheduleId} 不属于本排练，不允许跨排练批量调整`);
+        throw notFound('日程安排不存在');
+      }
+      if (s.status === 'cancelled') throw badRequest(`时段 #${scheduleId} 已取消，不能批量调整，请重新创建`);
+      const { sceneId, startAt, endAt } = validateSceneAndTimes(r, it, s);
+      return { scheduleId, existing: s, sceneId, startAt, endAt };
+    });
+
+    // 记录调整前各时段的当前批次 id，用于在成功后识别“实质变化的时段”
+    // （syncScheduleNotifications 只为指纹变化/恢复有效的时段生成新批次）。
+    const currentNotifId = (scheduleId) =>
+      db.prepare("SELECT id FROM schedule_notifications WHERE schedule_id = ? AND status = 'current'").get(scheduleId)?.id ??
+      null;
+    const beforeNotif = new Map(targets.map((t) => [t.scheduleId, currentNotifId(t.scheduleId)]));
+
+    transaction(() => {
+      // 按目标值更新（待调整时段合法化即恢复 active），随后用整批最终状态做冲突检测：
+      // 批内两两比较天然覆盖“两条时段互换时间”这类单看冲突、最终合法的情形。
+      const update = db.prepare(
+        "UPDATE rehearsal_schedules SET scene_id = ?, start_at = ?, end_at = ?, status = 'active' WHERE id = ?"
+      );
+      for (const t of targets) update.run(t.sceneId, t.startAt, t.endAt, t.scheduleId);
+
+      const candidates = targets.map((t) =>
+        buildCandidate({ scheduleId: t.scheduleId, rehearsal: r, sceneId: t.sceneId, startAt: t.startAt, endAt: t.endAt })
+      );
+      assertNoScheduleConflicts(candidates, '批量调整后参与演员与其他未取消时段重叠，整批调整未生效');
+      assertNoUnavailabilityConflicts(candidates, '批量调整后参与演员与其登记的不可用时段相撞，整批调整未生效');
+
+      // 通知：仅实质变化（含待调整恢复有效）的时段各生成一批；指纹不变不重发。
+      syncScheduleNotifications(r.id, 'batch_adjust', req.user.id);
+    });
+
+    const schedules = targets.map((t) => serializeSchedule(getScheduleOrThrow(t.scheduleId, r.id), r));
+    const notifications = schedules.map((s) => {
+      const newBatch = beforeNotif.get(s.id) !== s.notification?.id;
+      return {
+        scheduleId: s.id,
+        notification: s.notification,
+        changed: newBatch,
+      };
+    });
+    res.json({
+      schedules,
+      notifications,
+      changed: notifications.filter((x) => x.changed).map((x) => x.scheduleId),
+    });
   })
 );
 

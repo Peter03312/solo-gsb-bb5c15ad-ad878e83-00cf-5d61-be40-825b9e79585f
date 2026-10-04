@@ -397,6 +397,167 @@ async function main() {
   await req('PATCH', `/api/rehearsals/${rhA}/schedules/${schA1.id}`, lin, { startAt: '2030-01-01T09:00:00+08:00' }, 403);
   check('未派角演员查看 403；演员不能调整/取消日程', true);
 
+  console.log('— 批量调整：参数校验（空批次/不足两条/重复/跨排练/已取消/无台词/无效时间）—');
+  const batchUrl = `/api/rehearsals/${rhA}/schedules/batch`;
+  const itemOf = (s, patch = {}) => ({ scheduleId: s.id, sceneId: s.sceneId, startAt: s.startAt, endAt: s.endAt, ...patch });
+  await J(batchUrl, lin, { items: [itemOf(schA1), itemOf(schA2)] }, 403);
+  check('演员不能批量调整（403）', true);
+  await J(batchUrl, director, {}, 400);
+  await J(batchUrl, director, { items: [] }, 400);
+  await J(batchUrl, director, { items: [itemOf(schA1)] }, 400);
+  check('空批次与不足两条均 400', true);
+  await J(batchUrl, director, { items: [itemOf(schA1), itemOf(schA1)] }, 400);
+  check('批次内重复时段 400', true);
+  await J(batchUrl, director, { items: [itemOf(schA1), itemOf(schB2)] }, 400);
+  check('跨排练时段 400', true);
+  await J(batchUrl, director, { items: [itemOf(schA1), itemOf(schD1)] }, 400);
+  check('已取消时段 400', true);
+  await J(batchUrl, director, { items: [itemOf(schA1), itemOf(schA2, { sceneId: scEmpty })] }, 400);
+  check('无台词场次 400', true);
+  await J(batchUrl, director, {
+    items: [
+      itemOf(schA1),
+      { scheduleId: schA2.id, sceneId: sc2, startAt: '2030-01-01T12:00', endAt: '2030-01-01T13:00:00+08:00' },
+    ],
+  }, 400);
+  await J(batchUrl, director, {
+    items: [
+      itemOf(schA1),
+      itemOf(schA2, { startAt: '2030-01-01T12:00:00+08:00', endAt: '2030-01-01T11:00:00+08:00' }),
+    ],
+  }, 400);
+  check('无效时间/起止颠倒 400', true);
+  await J(batchUrl, director, { items: [itemOf(schA1), { scheduleId: 99999, sceneId: sc1, startAt: schA2.startAt, endAt: schA2.endAt }] }, 404);
+  check('不存在的时段 404', true);
+  const batchValidationA = await G(`/api/rehearsals/${rhA}/schedules`, director);
+  check('参数校验失败不改动任何时段',
+    batchValidationA.schedules.find((s) => s.id === schA1.id).startAt === schA1.startAt &&
+    batchValidationA.schedules.find((s) => s.id === schA2.id).startAt === schA2.startAt);
+
+  console.log('— 批量调整：整批无变化成功且不重发通知 —');
+  const seqA1Before = (await G(`/api/rehearsals/${rhA}/schedules/${schA1.id}/notifications`, director)).current.seq;
+  const seqA2Before = (await G(`/api/rehearsals/${rhA}/schedules/${schA2.id}/notifications`, director)).current.seq;
+  const noopBatch = await J(batchUrl, director, { items: [itemOf(schA1), itemOf(schA2)] }, 200);
+  check('批量提交返回 200 且顺序与提交一致', noopBatch.schedules.map((s) => s.id).join(',') === [schA1.id, schA2.id].join(','));
+  check('整批无变化不重发通知', noopBatch.changed.length === 0 &&
+    noopBatch.notifications.every((x) => x.changed === false), JSON.stringify(noopBatch.notifications));
+  check('通知批次序号未增长',
+    (await G(`/api/rehearsals/${rhA}/schedules/${schA1.id}/notifications`, director)).current.seq === seqA1Before &&
+    (await G(`/api/rehearsals/${rhA}/schedules/${schA2.id}/notifications`, director)).current.seq === seqA2Before);
+
+  console.log('— 批量调整：两条时段互换时间（单看冲突、最终无冲突）成功 —');
+  // schA1=sc1 10:00-11:00（林晚、陈默），schA3=sc1 12:00-13:00（林晚、陈默）；互换后最终仍不重叠
+  const swapBatch = await J(batchUrl, director, {
+    items: [
+      itemOf(schA1, { startAt: schA3.startAt, endAt: schA3.endAt }),
+      itemOf(schA3, { startAt: schA1.startAt, endAt: schA1.endAt }),
+    ],
+  }, 200);
+  const swappedA1 = swapBatch.schedules.find((s) => s.id === schA1.id);
+  const swappedA3 = swapBatch.schedules.find((s) => s.id === schA3.id);
+  check('互换后时段按目标时间落库', swappedA1.startAt === schA3.startAt && swappedA3.startAt === schA1.startAt);
+  check('两条实质变化均生成新通知批次', swapBatch.changed.length === 2, JSON.stringify(swapBatch.changed));
+  check('互换后各时段新批次 seq 增长',
+    (await G(`/api/rehearsals/${rhA}/schedules/${schA1.id}/notifications`, director)).current.seq === seqA1Before + 1 &&
+    (await G(`/api/rehearsals/${rhA}/schedules/${schA3.id}/notifications`, director)).current.seq === seqA2Before + 1);
+  // 换回，便于后续场景
+  await J(batchUrl, director, {
+    items: [
+      itemOf(swappedA1, { startAt: schA1.startAt, endAt: schA1.endAt }),
+      itemOf(swappedA3, { startAt: schA3.startAt, endAt: schA3.endAt }),
+    ],
+  }, 200);
+
+  console.log('— 批量调整：批内最终重叠 / 跨排练冲突 -> 409 整批不生效 —');
+  // 2030-01-10 空档建两条端点相接的时段（均含林晚、陈默），批量改成最终重叠
+  const bk1 = (await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-10T10:00:00+08:00', endAt: '2030-01-10T11:00:00+08:00' }, 201)).schedule;
+  const bk2 = (await J(`/api/rehearsals/${rhA}/schedules`, director, { sceneId: sc1, startAt: '2030-01-10T11:00:00+08:00', endAt: '2030-01-10T12:00:00+08:00' }, 201)).schedule;
+  const intraOv = await J(batchUrl, director, {
+    items: [
+      itemOf(bk1, { startAt: '2030-01-10T10:00:00+08:00', endAt: '2030-01-10T11:30:00+08:00' }),
+      itemOf(bk2, { startAt: '2030-01-10T11:00:00+08:00', endAt: '2030-01-10T12:30:00+08:00' }),
+    ],
+  }, 409);
+  check('批内最终重叠返回 SCHEDULE_CONFLICT 且指出双方时段',
+    intraOv.error === 'SCHEDULE_CONFLICT' &&
+    intraOv.details.conflicts.some((c) => [bk1.id, bk2.id].includes(c.schedule.id) && [bk1.id, bk2.id].includes(c.overlapsWith.id)),
+    JSON.stringify(intraOv.details));
+  const bkView = await G(`/api/rehearsals/${rhA}/schedules`, director);
+  check('冲突时整批不生效（两条均保持原样）',
+    bkView.schedules.find((s) => s.id === bk1.id).startAt === bk1.startAt &&
+    bkView.schedules.find((s) => s.id === bk2.id).startAt === bk2.startAt);
+  check('冲突失败不留通知批次',
+    (await G(`/api/rehearsals/${rhA}/schedules/${bk1.id}/notifications`, director)).current.seq === 1 &&
+    (await G(`/api/rehearsals/${rhA}/schedules/${bk2.id}/notifications`, director)).current.seq === 1);
+  // 批内合法但与其他排练有效时段冲突：schB2 在 RH_B v2（sc2=陈默）2030-01-02 10:00-11:00
+  // 注意：rhB 已在前面换到 v2；schB2 参与者含陈默
+  const crossOv = await J(batchUrl, director, {
+    items: [
+      itemOf(bk1, { startAt: '2030-01-02T10:30:00+08:00', endAt: '2030-01-02T11:30:00+08:00' }),
+      itemOf(bk2, { startAt: '2030-01-10T11:00:00+08:00', endAt: '2030-01-10T12:00:00+08:00' }),
+    ],
+  }, 409);
+  check('批量调整与其他排练日程冲突同样 409',
+    crossOv.error === 'SCHEDULE_CONFLICT' &&
+    crossOv.details.conflicts.some((c) => c.actorId === chenId && c.overlapsWith.id === schB2.id), JSON.stringify(crossOv.details));
+
+  console.log('— 批量调整：撞演员不可用 -> 409 整批不生效 —');
+  // 不可用窗口 12:00-12:30：与当前 bk2（11:00-12:00）端点相接，登记本身合法；
+  // 批量把 bk2 改到 11:30-12:30 后即重叠 -> 整批拒绝
+  const unBatch = (await J('/api/me/unavailability', lin, { startAt: '2030-01-10T12:00:00+08:00', endAt: '2030-01-10T12:30:00+08:00', reason: '批量调整测试' }, 201)).unavailability;
+  const unavOv = await J(batchUrl, director, {
+    items: [
+      itemOf(bk1, { startAt: '2030-01-10T10:00:00+08:00', endAt: '2030-01-10T11:00:00+08:00' }),
+      itemOf(bk2, { startAt: '2030-01-10T11:30:00+08:00', endAt: '2030-01-10T12:30:00+08:00' }),
+    ],
+  }, 409);
+  check('批量调整撞不可用返回 UNAVAILABILITY_CONFLICT 且含不可用记录',
+    unavOv.error === 'UNAVAILABILITY_CONFLICT' &&
+    unavOv.details.conflicts.some((c) => c.actorId === linId && c.unavailability.id === unBatch.id && c.schedule.id === bk2.id),
+    JSON.stringify(unavOv.details));
+  check('不可用冲突同样整批不生效',
+    (await G(`/api/rehearsals/${rhA}/schedules`, director)).schedules.find((s) => s.id === bk2.id).startAt === bk2.startAt);
+  await D(`/api/me/unavailability/${unBatch.id}`, lin, 200);
+
+  console.log('— 批量调整：端点相接成功；含未变化条目时仅变化者发通知 —');
+  // bk1 不动，bk2 改到与 bk1 端点相接（11:00-12:00 -> 12:00-13:00），仅 bk2 发通知
+  const touchBatch = await J(batchUrl, director, {
+    items: [
+      itemOf(bk1),
+      itemOf(bk2, { startAt: '2030-01-10T12:00:00+08:00', endAt: '2030-01-10T13:00:00+08:00' }),
+    ],
+  }, 200);
+  check('端点相接的批量调整成功', touchBatch.changed.length === 1 && touchBatch.changed[0] === bk2.id, JSON.stringify(touchBatch.changed));
+  check('未变化条目不重发通知',
+    (await G(`/api/rehearsals/${rhA}/schedules/${bk1.id}/notifications`, director)).current.seq === 1);
+
+  console.log('— 批量调整：待调整恢复有效 + 已开启到场登记保持快照 —');
+  // 新排练 RH_F 固定 v2 -> v3：两条 sc2 时段待调整；给第一条开启登记并签到，批量恢复后快照不变
+  const rhF = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '批量排练F' }, 201)).id;
+  await J(`/api/rehearsals/${rhF}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  const schF1 = (await J(`/api/rehearsals/${rhF}/schedules`, director, { sceneId: sc2, startAt: '2030-03-01T10:00:00+08:00', endAt: '2030-03-01T11:00:00+08:00' }, 201)).schedule;
+  const schF2 = (await J(`/api/rehearsals/${rhF}/schedules`, director, { sceneId: sc2, startAt: '2030-03-01T11:00:00+08:00', endAt: '2030-03-01T12:00:00+08:00' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, director, {}, 201);
+  await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance/check-in`, lin, {}, 201);
+  await J(`/api/rehearsals/${rhF}/switch-version`, director, { versionId: pv3 }, 200);
+  check('换版后两条均为待调整',
+    (await G(`/api/rehearsals/${rhF}/schedules`, director)).schedules
+      .filter((s) => [schF1.id, schF2.id].includes(s.id))
+      .every((s) => s.status === 'needs_adjustment'));
+  const restoreBatch = await J(`/api/rehearsals/${rhF}/schedules/batch`, director, {
+    items: [
+      { scheduleId: schF1.id, sceneId: sc1, startAt: '2030-03-02T10:00:00+08:00', endAt: '2030-03-02T11:00:00+08:00' },
+      { scheduleId: schF2.id, sceneId: sc1, startAt: '2030-03-02T11:00:00+08:00', endAt: '2030-03-02T12:00:00+08:00' },
+    ],
+  }, 200);
+  check('批量调整使待调整时段恢复有效', restoreBatch.schedules.every((s) => s.status === 'active' && s.sceneId === sc1));
+  check('恢复有效均生成新批次', restoreBatch.changed.length === 2, JSON.stringify(restoreBatch.changed));
+  const attF1After = (await G(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, director)).session;
+  check('已开启到场登记保持开启时快照（UTC 时段/版本/签到不回写）',
+    attF1After.startAt === '2030-03-01T02:00:00.000Z' && attF1After.versionId === pv2 &&
+    attF1After.stats.checkedIn === 1 && attF1After.status === 'open', JSON.stringify(attF1After.stats));
+
+
   console.log('— 到场登记：开启冻结名单与缺口 —');
   // 专用剧本 p3：AT1/AT2；角色 RX/RY/RZ；v1 三角在 AT1 均有台词；v2 仅改 RX 文本（场次台词仍在）
   const p3 = await J('/api/plays', director, { title: '登记测试剧' }, 201);
